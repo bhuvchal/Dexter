@@ -24,16 +24,22 @@ func vterm_on_settermprop(prop: VTermProp, val: UnsafeMutablePointer<VTermValue>
 }
 func vterm_on_bell(user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
 func vterm_on_resize(rows: Int32, cols: Int32, user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
-func vterm_on_sb_pushline(cols: Int32, cells: UnsafePointer<VTermScreenCell>?, user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
+func vterm_on_sb_pushline(cols: Int32, cells: UnsafePointer<VTermScreenCell>?, user: UnsafeMutableRawPointer?) -> Int32 { 
+    let state = Unmanaged<TerminalState>.fromOpaque(user!).takeUnretainedValue()
+    state.archivePushedLine(cols: cols, cells: cells)
+    return 1 
+}
 func vterm_on_sb_popline(cols: Int32, cells: UnsafeMutablePointer<VTermScreenCell>?, user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
-func vterm_on_sb_clear(user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
+func vterm_on_sb_clear(user: UnsafeMutableRawPointer?) -> Int32 { 
+    let state = Unmanaged<TerminalState>.fromOpaque(user!).takeUnretainedValue()
+    state.clearArchive()
+    return 1 
+}
 func vterm_on_sb_pushline4(cols: Int32, cells: UnsafePointer<VTermScreenCell>?, isbottom: Bool, user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
 
 func vterm_on_output(s: UnsafePointer<CChar>?, len: Int, user: UnsafeMutableRawPointer?) {
-    guard let s = s else { return }
     let state = Unmanaged<TerminalState>.fromOpaque(user!).takeUnretainedValue()
     if state.ptyFD > 0 {
-        print("> Sending \(len) bytes to PTY via vterm_on_output")
         _ = write_pty(state.ptyFD, s, len)
     }
 }
@@ -56,6 +62,11 @@ class TerminalState {
     // We will render to this view
     weak var textView: NSTextView?
     
+    // Scrollback Archive
+    var archiveBuffer = NSMutableAttributedString()
+    var lastArchiveLength = 0
+    let maxArchiveLength = 500000 // characters roughly
+    
     // Retain callbacks structure so C doesnt lose it
     var screenCallbacksPtr: UnsafeMutablePointer<VTermScreenCallbacks>!
     
@@ -65,10 +76,28 @@ class TerminalState {
         vterm = vterm_new_with_allocator(24, 80, &allocator, nil)
         vterm_set_utf8(vterm, 1)
         
+        // Define Custom ANSI Palette
+        if let state = vterm_obtain_state(vterm) {
+            let colors = TerminalConfig.current.ansiColorsHex
+            for (index, hex) in colors.enumerated() {
+                if index < 16, let color = NSColor(hex: hex), let rgbColor = color.usingColorSpace(.deviceRGB) {
+                    let r = UInt8(rgbColor.redComponent * 255.0)
+                    let g = UInt8(rgbColor.greenComponent * 255.0)
+                    let b = UInt8(rgbColor.blueComponent * 255.0)
+                    cvterm_set_palette_rgb(state, Int32(index), r, g, b)
+                }
+            }
+        }
+        
         vtermScreen = vterm_obtain_screen(vterm)
         vterm_screen_reset(vtermScreen, 1) // 1 = hard reset
         
         setupCallbacks()
+        
+        // Wire Inline Widgets to the Input Shell PTY
+        WidgetInterceptor.shared.onCommandTriggered = { [weak self] cmd in
+            self?.writeToPTY(string: cmd)
+        }
         
         // Spawn PTY
         pid = spawn_pty(&ptyFD, 24, 80)
@@ -117,10 +146,13 @@ class TerminalState {
             while true {
                 let bytesRead = read_pty(self.ptyFD, buffer, bufferSize)
                 if bytesRead > 0 {
-                    print("> Read \(bytesRead) bytes from PTY")
-                    vterm_input_write(self.vterm, buffer, bytesRead)
-                    
-                    DispatchQueue.main.async {
+                    let data = Data(bytes: buffer, count: bytesRead)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self else { return }
+                        data.withUnsafeBytes { ptr in
+                            vterm_input_write(self.vterm, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), data.count)
+                        }
+                        
                         if self.isAlternateBuffer {
                             self.renderGrid()
                         } else {
@@ -161,6 +193,114 @@ class TerminalState {
                        alpha: 1.0)
     }
 
+    private func mapSymbol(_ char: Character) -> String {
+        switch char {
+        case ">": return "›"
+        case "✗": return "✕"
+        case "✔": return "✓"
+        case "➜": return "→"
+        default: return String(char)
+        }
+    }
+    
+    // --- Scrollback Archiving ---
+    func archivePushedLine(cols: Int32, cells: UnsafePointer<VTermScreenCell>?) {
+        guard let cells = cells else { return }
+        
+        // Dont archive lines if we are in alternate screen (like Vim)
+        if isAlternateBuffer { return }
+        
+        let propFont = NSFont(name: TerminalConfig.current.proportionalFontName, size: TerminalConfig.current.proportionalFontSize) ?? NSFont.systemFont(ofSize: TerminalConfig.current.proportionalFontSize)
+        let defaultTextColor = TerminalConfig.current.textColor
+        let colWidth: CGFloat = TerminalConfig.current.monoCharacterAdvance // Advance for column alignment
+        
+        let archivedLine = NSMutableAttributedString()
+        var lastNonEmptyCol = -1
+        
+        for c in 0..<Int(cols) {
+            let cell = cells[c]
+            let charVal = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
+            if charVal != " " && cell.chars.0 != 0 {
+                lastNonEmptyCol = Int(c)
+            }
+        }
+        
+        let trimCol = lastNonEmptyCol
+        let actualLineCount = trimCol + 1
+        
+        var i = 0
+        var tabStops: [NSTextTab] = []
+        
+        while i < actualLineCount {
+            let cell = cells[i]
+            let cChar = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
+            
+            let fgColor = getNSColor(from: cell.fg, isFg: true) ?? defaultTextColor
+            let bgColor = getNSColor(from: cell.bg, isFg: false)
+            
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: propFont,
+                .foregroundColor: fgColor
+            ]
+            if let bg = bgColor { attributes[.backgroundColor] = bg }
+            
+            let displayedChar = mapSymbol(cChar)
+            
+            if cChar == " " {
+                var spaces = 0
+                var j = i
+                while j < actualLineCount {
+                    let nextCell = cells[j]
+                    let nextCharVal = nextCell.chars.0 != 0 ? Character(UnicodeScalar(nextCell.chars.0) ?? " ") : " "
+                    if nextCharVal == " " {
+                        spaces += 1
+                        j += 1
+                    } else { break }
+                }
+                
+                if spaces >= 2 {
+                    let tabLocation = CGFloat(j) * colWidth
+                    tabStops.append(NSTextTab(textAlignment: .left, location: tabLocation))
+                    archivedLine.append(NSAttributedString(string: "\t", attributes: attributes))
+                } else {
+                    archivedLine.append(NSAttributedString(string: " ", attributes: attributes))
+                }
+                i = j
+            } else {
+                archivedLine.append(NSAttributedString(string: displayedChar, attributes: attributes))
+                i += 1
+            }
+        }
+        
+        archivedLine.append(NSAttributedString(string: "\n", attributes: [.font: propFont]))
+        
+        let pStyle = NSMutableParagraphStyle()
+        pStyle.tabStops = tabStops
+        pStyle.defaultTabInterval = colWidth
+        archivedLine.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: archivedLine.length))
+        
+        WidgetInterceptor.shared.parseAndInjectWidgets(into: archivedLine)
+        
+        self.archiveBuffer.append(archivedLine)
+        
+        if self.archiveBuffer.length > self.maxArchiveLength {
+            let excess = self.archiveBuffer.length - self.maxArchiveLength
+            self.archiveBuffer.deleteCharacters(in: NSRange(location: 0, length: excess))
+        }
+    }
+    
+    func clearArchive() {
+        if Thread.isMainThread {
+            self.archiveBuffer = NSMutableAttributedString()
+            self.lastArchiveLength = 0
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.archiveBuffer = NSMutableAttributedString()
+                self?.lastArchiveLength = 0
+            }
+        }
+    }
+
     // --- Grid Rendering (TUI View) ---
     func renderGrid() {
         guard let textView = textView else { return }
@@ -177,8 +317,8 @@ class TerminalState {
         var foundCursor = false
         
         let fullText = NSMutableAttributedString()
-        let monoFont = NSFont(name: "Menlo", size: 14) ?? NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        let defaultTextColor = NSColor.textColor
+        let monoFont = NSFont(name: TerminalConfig.current.monoFontName, size: TerminalConfig.current.monoFontSize) ?? NSFont.monospacedSystemFont(ofSize: TerminalConfig.current.monoFontSize, weight: .regular)
+        let defaultTextColor = TerminalConfig.current.textColor
         
         for r in 0..<vtermRows {
             var lineStr = ""
@@ -215,13 +355,21 @@ class TerminalState {
             fullText.append(lineAttr)
         }
         
+        let oldSelectedRange = textView.selectedRange()
+        
         textView.textStorage?.setAttributedString(fullText)
         textView.needsDisplay = true
         
-        if foundCursor {
-            textView.setSelectedRange(NSRange(location: textCursorIndex, length: 0))
-        } else {
-            textView.setSelectedRange(NSRange(location: fullText.length, length: 0))
+        if let tv = textView as? TerminalTextView {
+            tv.isProgrammaticSelection = true
+            if foundCursor {
+                tv.setSelectedRange(NSRange(location: textCursorIndex, length: 0))
+            } else if oldSelectedRange.length > 0 {
+                tv.setSelectedRange(oldSelectedRange)
+            } else {
+                tv.setSelectedRange(NSRange(location: fullText.length, length: 0))
+            }
+            tv.isProgrammaticSelection = false
         }
     }
     
@@ -242,23 +390,20 @@ class TerminalState {
         
         let fullText = NSMutableAttributedString()
         
-        let propFont = NSFont(name: "Charter", size: 18) ?? NSFont.systemFont(ofSize: 18)
-        let defaultTextColor = NSColor.textColor
-        let colWidth: CGFloat = 10.8 // Standard Menlo 18 advance
+        let propFont = NSFont(name: TerminalConfig.current.proportionalFontName, size: TerminalConfig.current.proportionalFontSize) ?? NSFont.systemFont(ofSize: TerminalConfig.current.proportionalFontSize)
+        let defaultTextColor = TerminalConfig.current.textColor
+        let colWidth: CGFloat = TerminalConfig.current.monoCharacterAdvance // Advance for column alignment
         
         var currentParagraph = NSMutableAttributedString()
         var tabStops: [NSTextTab] = []
         
         for r in 0..<vtermRows {
-            var lineStr = ""
             var lastNonEmptyCol = -1
             
             for c in 0..<vtermCols {
                 var cell = VTermScreenCell()
                 vterm_screen_get_cell(vtermScreen, VTermPos(row: r, col: c), &cell)
-                
                 let charVal = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
-                lineStr.append(charVal)
                 if charVal != " " && cell.chars.0 != 0 {
                     lastNonEmptyCol = Int(c)
                 }
@@ -269,26 +414,17 @@ class TerminalState {
                 trimCol = max(trimCol, Int(cursor.col) - 1)
             }
             
-            var actualLine = ""
-            if trimCol >= 0 {
-                let endIdx = min(trimCol + 1, lineStr.count)
-                actualLine = String(lineStr.prefix(endIdx))
-            }
-            
+            let actualLineCount = trimCol + 1
             let processedLineAttrs = NSMutableAttributedString()
-            var localCursorIdx = -1
-            var i = 0
+            var colToIndex = [Int: Int]()
             
-            while i < actualLine.count {
-                if r == cursor.row && i == Int(cursor.col) {
-                    localCursorIdx = processedLineAttrs.length
-                }
-                
-                let charIdx = actualLine.index(actualLine.startIndex, offsetBy: i)
-                let cChar = actualLine[charIdx]
+            var i = 0
+            while i < actualLineCount {
+                colToIndex[i] = processedLineAttrs.length
                 
                 var cell = VTermScreenCell()
                 vterm_screen_get_cell(vtermScreen, VTermPos(row: r, col: Int32(i)), &cell)
+                let cChar = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
                 
                 let fgColor = getNSColor(from: cell.fg, isFg: true) ?? defaultTextColor
                 let bgColor = getNSColor(from: cell.bg, isFg: false)
@@ -299,15 +435,17 @@ class TerminalState {
                 ]
                 if let bg = bgColor { attributes[.backgroundColor] = bg }
                 
+                let displayedChar = mapSymbol(cChar)
+                
                 if cChar == " " {
                     var spaces = 0
                     var j = i
-                    while j < actualLine.count {
-                        let jIdx = actualLine.index(actualLine.startIndex, offsetBy: j)
-                        if actualLine[jIdx] == " " {
-                            if r == cursor.row && j == Int(cursor.col) && j > i {
-                                localCursorIdx = processedLineAttrs.length + 1
-                            }
+                    while j < actualLineCount {
+                        var nextCell = VTermScreenCell()
+                        vterm_screen_get_cell(vtermScreen, VTermPos(row: r, col: Int32(j)), &nextCell)
+                        let nextCharVal = nextCell.chars.0 != 0 ? Character(UnicodeScalar(nextCell.chars.0) ?? " ") : " "
+                        if nextCharVal == " " {
+                            colToIndex[j] = processedLineAttrs.length
                             spaces += 1
                             j += 1
                         } else { break }
@@ -322,22 +460,20 @@ class TerminalState {
                     }
                     i = j
                 } else {
-                    processedLineAttrs.append(NSAttributedString(string: String(cChar), attributes: attributes))
+                    processedLineAttrs.append(NSAttributedString(string: displayedChar, attributes: attributes))
                     i += 1
                 }
             }
             
-            if r == cursor.row && Int(cursor.col) >= actualLine.count {
-                localCursorIdx = processedLineAttrs.length
-            }
+            colToIndex[actualLineCount] = processedLineAttrs.length
             
             if r == cursor.row {
-                if localCursorIdx == -1 { localCursorIdx = 0 }
-                textCursorIndex = fullText.length + currentParagraph.length + localCursorIdx
+                let safeCol = min(Int(cursor.col), actualLineCount)
+                textCursorIndex = fullText.length + currentParagraph.length + (colToIndex[safeCol] ?? processedLineAttrs.length)
                 foundCursor = true
             }
             
-            if trimCol >= vtermCols - 2 && trimCol > 0 {
+            if trimCol >= vtermCols - 2 && trimCol > 0 && r != cursor.row {
                 // Soft wrap
                 currentParagraph.append(processedLineAttrs)
             } else {
@@ -364,20 +500,54 @@ class TerminalState {
             fullText.append(currentParagraph)
         }
         
-        textView.textStorage?.setAttributedString(fullText)
+        WidgetInterceptor.shared.parseAndInjectWidgets(into: fullText)
+        
+        let oldSelectedRange = textView.selectedRange()
+        
+        // --- Delta Memory Rendering for Infinite Scroll ---
+        guard let textStorage = textView.textStorage else { return }
+        
+        let currentTotalLength = textStorage.length
+        let targetArchiveLength = archiveBuffer.length
+        
+        textStorage.beginEditing()
+        
+        // Case 1: The archive buffer grew (or shrank via clear). We need to sync the prefix.
+        if lastArchiveLength != targetArchiveLength || currentTotalLength < lastArchiveLength {
+            // Brute force sync the archive block if it desyncs
+            let replaceRange = NSRange(location: 0, length: min(lastArchiveLength, currentTotalLength))
+            textStorage.replaceCharacters(in: replaceRange, with: archiveBuffer)
+            lastArchiveLength = targetArchiveLength
+        }
+        
+        // Case 2: Replace only the active grid portion of the screen (O(1) allocation)
+        let gridStart = lastArchiveLength
+        let gridLength = textStorage.length - gridStart
+        let gridRange = NSRange(location: gridStart, length: gridLength >= 0 ? gridLength : 0)
+        
+        textStorage.replaceCharacters(in: gridRange, with: fullText)
+        textStorage.endEditing()
+        
         textView.needsDisplay = true
         
-        if foundCursor {
-            textView.setSelectedRange(NSRange(location: textCursorIndex, length: 0))
-        } else {
-            textView.setSelectedRange(NSRange(location: fullText.length, length: 0))
+        if let tv = textView as? TerminalTextView {
+            tv.isProgrammaticSelection = true
+            if foundCursor {
+                let finalCursorRange = NSRange(location: lastArchiveLength + textCursorIndex, length: 0)
+                tv.setSelectedRange(finalCursorRange)
+                
+                // Optional: strictly lock the view to the cursor on active updates
+                tv.scrollRangeToVisible(finalCursorRange)
+            } else if oldSelectedRange.length > 0 {
+                tv.setSelectedRange(oldSelectedRange)
+            } else {
+                tv.setSelectedRange(NSRange(location: textStorage.length, length: 0))
+            }
+            tv.isProgrammaticSelection = false
         }
         
-        let scrollView = textView.enclosingScrollView
-        if let docView = scrollView?.documentView as? NSView {
-            let pt = NSPoint(x: 0, y: docView.bounds.height)
-            docView.scroll(pt)
-        }
+        // Force scroll to bottom so typing guarantees visibility
+        textView.scrollToEndOfDocument(nil)
     }
 
     // --- Keyboard Handling Mapping to Libvterm ---

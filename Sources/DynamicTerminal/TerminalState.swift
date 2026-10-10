@@ -105,6 +105,7 @@ class TerminalState {
     var archiveBuffer = NSMutableAttributedString()
     var lastArchiveLength = 0
     let maxArchiveLength = 500000 // characters roughly
+    let archiveTrimSlack = 100000
     
     // Retain callbacks structure so C doesnt lose it
     var screenCallbacksPtr: UnsafeMutablePointer<VTermScreenCallbacks>!
@@ -505,14 +506,24 @@ class TerminalState {
         
         self.archiveBuffer.append(archivedLine)
         
-        if self.archiveBuffer.length > self.maxArchiveLength {
-            let excess = self.archiveBuffer.length - self.maxArchiveLength
-            self.archiveBuffer.deleteCharacters(in: NSRange(location: 0, length: excess))
-            if self.lastArchiveLength > excess {
-                self.lastArchiveLength -= excess
-            } else {
-                self.lastArchiveLength = 0
+        // Trim in batches: deleting from the front memmoves the whole buffer, so doing it
+        // per line made heavy output O(n^2). Cut on a line boundary so no partial line remains.
+        if self.archiveBuffer.length > self.maxArchiveLength + self.archiveTrimSlack {
+            var excess = self.archiveBuffer.length - self.maxArchiveLength
+            let text = self.archiveBuffer.mutableString
+            let newline = text.range(of: "\n", options: [], range: NSRange(location: excess, length: text.length - excess))
+            if newline.location != NSNotFound {
+                excess = newline.location + 1
             }
+            self.archiveBuffer.deleteCharacters(in: NSRange(location: 0, length: excess))
+
+            // Drop the same prefix from the text view so render can keep delta-appending
+            // instead of falling back to a full re-layout every frame.
+            let synced = min(excess, self.lastArchiveLength)
+            if synced > 0, let textStorage = self.textView?.textStorage, textStorage.length >= synced {
+                textStorage.deleteCharacters(in: NSRange(location: 0, length: synced))
+            }
+            self.lastArchiveLength -= synced
         }
     }
     
@@ -723,7 +734,7 @@ class TerminalState {
         }
         
         // Case 1: The archive buffer grew (or shrank via clear). We need to sync the prefix.
-        if !wasInAlternateBuffer && targetArchiveLength > lastArchiveLength && targetArchiveLength < maxArchiveLength {
+        if !wasInAlternateBuffer && targetArchiveLength > lastArchiveLength && currentTotalLength >= lastArchiveLength {
             // O(1) Delta Append: The archive purely grew. Just insert the new lines at the end of the history.
             // This prevents AppKit from invalidating the layout cache for the entire preceding scrollback.
             let appendedLength = targetArchiveLength - lastArchiveLength

@@ -232,6 +232,13 @@ class TerminalWindowController: NSWindowController, NSWindowDelegate, NSTextView
         terminalState?.resize(to: scrollView.bounds.size)
     }
 
+    // Zoom, window tiling and programmatic resizes don't go through a live resize.
+    func windowDidResize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, !window.inLiveResize,
+              let scrollView = textView?.enclosingScrollView else { return }
+        terminalState?.resize(to: scrollView.bounds.size)
+    }
+
     func windowDidEnterFullScreen(_ notification: Notification) {
         DispatchQueue.main.async {
             guard let scrollView = self.textView?.enclosingScrollView else { return }

@@ -40,7 +40,9 @@ func vterm_on_sb_pushline(cols: Int32, cells: UnsafePointer<VTermScreenCell>?, u
     state.archivePushedLine(cols: cols, cells: cells)
     return 1 
 }
-func vterm_on_sb_popline(cols: Int32, cells: UnsafeMutablePointer<VTermScreenCell>?, user: UnsafeMutableRawPointer?) -> Int32 { return 1 }
+// Returning 1 tells libvterm we filled `cells`; we don't, and its zero-width cells make
+// resize_buffer loop forever. Scrollback lives in our own archive, so decline.
+func vterm_on_sb_popline(cols: Int32, cells: UnsafeMutablePointer<VTermScreenCell>?, user: UnsafeMutableRawPointer?) -> Int32 { return 0 }
 func vterm_on_sb_clear(user: UnsafeMutableRawPointer?) -> Int32 { 
     let state = Unmanaged<TerminalState>.fromOpaque(user!).takeUnretainedValue()
     state.clearArchive()

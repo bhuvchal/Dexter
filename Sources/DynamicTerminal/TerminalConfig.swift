@@ -4,6 +4,7 @@ import AppKit
 struct TerminalConfig: Codable {
     var proportionalFontName: String = "Copernicus Trial"
     var proportionalFontSize: CGFloat = 14.0
+    var lineHeightMultiple: CGFloat = 1.3 // Gives text that spacious, premium document feel
     
     var monoFontName: String = "JetBrainsMono"
     var monoFontSize: CGFloat = 14.0
@@ -22,6 +23,14 @@ struct TerminalConfig: Codable {
     
     var tabInterval: CGFloat = 75.0
     var monoCharacterAdvance: CGFloat = 10.8
+    
+    // Dynamically computed from actual font metrics — always pixel-perfect
+    var columnWidth: CGFloat {
+        let monoFont = NSFont(name: monoFontName, size: monoFontSize)
+            ?? NSFont.monospacedSystemFont(ofSize: monoFontSize, weight: .regular)
+        let sample = NSAttributedString(string: "M", attributes: [.font: monoFont])
+        return sample.size().width
+    }
     
     static var current: TerminalConfig = .load()
     
@@ -63,6 +72,14 @@ struct TerminalConfig: Codable {
 }
 
 extension NSColor {
+    func toHex() -> String {
+        guard let rgb = usingColorSpace(.sRGB) else { return "#000000" }
+        let r = Int((rgb.redComponent   * 255).rounded())
+        let g = Int((rgb.greenComponent * 255).rounded())
+        let b = Int((rgb.blueComponent  * 255).rounded())
+        return String(format: "#%02x%02x%02x", r, g, b)
+    }
+
     convenience init?(hex: String) {
         var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")

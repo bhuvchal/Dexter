@@ -18,7 +18,7 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedLibrary("vterm", .when(platforms: [.macOS])),
-                .unsafeFlags(["-L/Users/bhuvanchalla/Documents/DynamicTerminal/Sources/CVTerm"])
+                .unsafeFlags(["-LSources/CVTerm"])
             ]
         ),
         // Swift Executable

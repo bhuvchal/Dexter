@@ -6,3 +6,11 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Build output
+/DynamicTerminal.app
+*.o
+*.dSYM
+
+# JS tooling (old Electron prototype)
+node_modules/

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+search - Web search results right in your terminal.
+Usage: search <query>
+"""
+
+import sys
+import urllib.request
+import urllib.parse
+import re
+import html
+import unicodedata
+
+
+def is_clean_text(text):
+    """Filter out garbage: walls of symbols, encoded junk, or overly short text."""
+    if len(text) < 15:
+        return False
+    # Count printable letter/digit ratio
+    letters = sum(1 for c in text if c.isalnum() or c.isspace())
+    if len(text) > 0 and letters / len(text) < 0.5:
+        return False
+    # Reject if too many special unicode chars
+    weird = sum(1 for c in text if unicodedata.category(c).startswith(('So', 'Cn', 'Co')))
+    if weird > 5:
+        return False
+    return True
+
+
+def clean_text(raw):
+    """Strip HTML tags, unescape entities, normalize whitespace."""
+    text = re.sub(r'<[^>]+>', '', raw)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_url(raw_url):
+    """Extract actual URL from DuckDuckGo redirect wrapper."""
+    uddg = re.search(r'uddg=([^&]+)', raw_url)
+    if uddg:
+        url = urllib.parse.unquote(uddg.group(1))
+        # Remove tracking fragments
+        url = re.sub(r'&(amp;)?rut=[a-f0-9]+', '', url)
+        return url
+    if raw_url.startswith("//"):
+        return "https:" + raw_url
+    return raw_url
+
+
+def search(query):
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"\033[31m  Error: {e}\033[0m")
+        return
+
+    # Extract result blocks
+    links = re.findall(
+        r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        page, re.DOTALL
+    )
+    snippets = re.findall(
+        r'class="result__snippet"[^>]*>(.*?)</(?:td|div|span|a)',
+        page, re.DOTALL
+    )
+
+    if not links:
+        print(f"\033[33m  No results found for: {query}\033[0m")
+        return
+
+    # Header
+    print(f"\n\033[1;37m  Search: \033[36m{query}\033[0m")
+    print(f"\033[90m  {'─' * 50}\033[0m\n")
+
+    count = 0
+    for i, (raw_url, raw_title) in enumerate(links):
+        if count >= 8:
+            break
+
+        title = clean_text(raw_title)
+        actual_url = extract_url(raw_url)
+
+        if not actual_url.startswith("http"):
+            continue
+        # Skip ads and tracking junk
+        if "ad_domain" in raw_url or "ad_provider" in raw_url:
+            continue
+        if len(actual_url) > 300:
+            continue
+
+        # Get snippet
+        snippet = ""
+        if i < len(snippets):
+            snippet = clean_text(snippets[i])
+
+        # Skip garbage results
+        if not is_clean_text(title):
+            continue
+
+        count += 1
+
+        # Title
+        print(f"  \033[1;37m{count}. {title}\033[0m")
+        # URL — clean and clickable
+        print(f"     \033[34m{actual_url}\033[0m")
+        # Snippet — word-wrapped in grey
+        if snippet and is_clean_text(snippet):
+            words = snippet.split()
+            line = "     "
+            for w in words:
+                if len(line) + len(w) + 1 > 76:
+                    print(f"\033[90m{line}\033[0m")
+                    line = "     "
+                line += w + " "
+            if line.strip():
+                print(f"\033[90m{line}\033[0m")
+        print()
+
+    print(f"\033[90m  {'─' * 50}\033[0m")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: search <query>")
+        sys.exit(1)
+    search(" ".join(sys.argv[1:]))

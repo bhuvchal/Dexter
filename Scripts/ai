@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""
+ai - Amortized-context AI for DynamicTerminal.
+
+Usage:
+    ai -ask "question"       Ask a question (uses search if needed)
+    ai -cmd "task"           Generate and run a command
+    ai -fix                  Fix last failed command
+    ai -ctx                  Show current context
+    ai "question"            Same as -ask
+"""
+
+import sys
+import os
+import json
+import re
+import subprocess
+import urllib.request
+import threading
+
+
+class Spinner:
+    """⟡  Thinking  — wave animation: one character bold at a time."""
+    WORD = "Thinking"
+
+    def __init__(self):
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._stopped = False
+
+    def _spin(self):
+        word = self.WORD
+        i = 0
+        while not self._stop_event.is_set():
+            pos = i % len(word)
+            before = word[:pos]
+            char = word[pos]
+            after = word[pos + 1:]
+            line = f"\033[90m⟡  {before}\033[1;37m{char}\033[90m{after}\033[0m"
+            sys.stdout.write(f"\033[2K\r{line}")
+            sys.stdout.flush()
+            i += 1
+            self._stop_event.wait(0.12)
+
+    def start(self):
+        self._stop_event.clear()
+        self._stopped = False
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, print_prefix=False):
+        if self._stopped:
+            return
+        self._stopped = True
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        if print_prefix:
+            sys.stdout.write(f"\033[2K\r\033[90m⟡  \033[0m")
+        else:
+            sys.stdout.write("\033[2K\r")
+        sys.stdout.flush()
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+MODEL = "mistral"
+CTX_DIR = os.path.expanduser("~/.dynamicterminal")
+CTX_LOG = os.path.join(CTX_DIR, "context.jsonl")
+DIRMAP = os.path.join(CTX_DIR, "dirmap.json")
+
+
+def load_context():
+    entries = []
+    if os.path.exists(CTX_LOG):
+        with open(CTX_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    return entries[-30:]
+
+
+def load_dirmap():
+    if os.path.exists(DIRMAP):
+        with open(DIRMAP) as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def format_tree(node, indent=0):
+    if not node:
+        return ""
+    prefix = "  " * indent
+    if node.get("type") == "file":
+        return f"{prefix}{node['name']}\n"
+    result = f"{prefix}{node['name']}/\n"
+    for child in node.get("children", [])[:15]:
+        result += format_tree(child, indent + 1)
+    return result
+
+
+def context_summary(entries, dirmap):
+    """Build a concise context block."""
+    parts = []
+    if dirmap:
+        tree_str = format_tree(dirmap)
+        if len(tree_str) < 1500:
+            parts.append(f"Project structure:\n{tree_str}")
+    if entries:
+        parts.append("Recent commands:")
+        for e in entries[-15:]:
+            status = "ok" if e.get("exit", 0) == 0 else f"FAILED(exit {e.get('exit')})"
+            cmd = e.get("cmd", "")
+            cwd = os.path.basename(e.get("cwd", ""))
+            branch = e.get("branch", "")
+            loc = f"{cwd}" + (f"({branch})" if branch else "")
+            parts.append(f"  [{status}] {loc}$ {cmd}")
+    return "\n".join(parts)
+
+
+def call_search(query):
+    try:
+        result = subprocess.run(
+            ["search", query],
+            capture_output=True, text=True, timeout=10
+        )
+        return result.stdout[:1500]
+    except Exception:
+        return ""
+
+
+def stream_ollama(prompt, system_prompt, spinner=None):
+    payload = json.dumps({
+        "model": MODEL,
+        "prompt": prompt,
+        "system": system_prompt,
+        "stream": True,
+        "options": {"temperature": 0.2, "num_predict": 400},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            full = ""
+            first_token = True
+            for line in resp:
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                    token = chunk.get("response", "")
+                    full += token
+                    if token and first_token:
+                        if spinner:
+                            spinner.stop(print_prefix=True)
+                        first_token = False
+                    print(token, end="", flush=True)
+                    if chunk.get("done"):
+                        break
+                except json.JSONDecodeError:
+                    continue
+            print()
+            return full
+    except urllib.error.URLError:
+        if spinner:
+            spinner.stop()
+        print("\033[31m  Cannot connect to Ollama. Run: ollama serve\033[0m")
+        return ""
+    except Exception as e:
+        if spinner:
+            spinner.stop()
+        print(f"\033[31m  Error: {e}\033[0m")
+        return ""
+
+
+def chat_ollama(messages, tools=None, spinner=None):
+    """Call the /api/chat endpoint with tool support. Yields tokens or returns tool calls."""
+    payload_dict = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": True,
+        "options": {"temperature": 0.2, "num_predict": 1000},
+    }
+    if tools:
+        payload_dict["tools"] = tools
+
+    payload = json.dumps(payload_dict).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_CHAT_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    full_message = {"role": "assistant", "content": ""}
+    tool_calls_buffer = []
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            first_output = True
+            for line in resp:
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                    msg = chunk.get("message", {})
+
+                    if "content" in msg and msg["content"]:
+                        if first_output and spinner:
+                            spinner.stop(print_prefix=True)
+                            first_output = False
+                        content = msg["content"]
+                        full_message["content"] += content
+                        print(content, end="", flush=True)
+
+                    if "tool_calls" in msg:
+                        if first_output and spinner:
+                            spinner.stop()
+                            first_output = False
+                        for tc in msg["tool_calls"]:
+                            tool_calls_buffer.append(tc)
+                            
+                    if chunk.get("done"):
+                        break
+                except json.JSONDecodeError:
+                    continue
+            
+            if tool_calls_buffer:
+                full_message["tool_calls"] = tool_calls_buffer
+            
+            # Fallback 1: Many local models emit tool calls as markdown JSON arrays instead of using the API
+            if not tool_calls_buffer and full_message["content"]:
+                match = re.search(r'\[\s*\{\s*"name"\s*:\s*"run_shell_command".*?\]', full_message["content"], re.DOTALL)
+                if match:
+                    try:
+                        parsed_tools = json.loads(match.group(0))
+                        full_message["tool_calls"] = []
+                        import random
+                        for pt in parsed_tools:
+                            full_message["tool_calls"].append({
+                                "id": f"call_{random.randint(1000, 9999)}",
+                                "function": {
+                                    "name": pt.get("name"),
+                                    "arguments": json.dumps(pt.get("arguments", {}))
+                                }
+                            })
+                        full_message["content"] = "" # Scrub hallucinated markdown
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                
+            # Fallback 2: Sometimes it just writes `run_shell_command("bash command")` or `run_shell_command <bash command>`
+            if not full_message.get("tool_calls") and full_message["content"]:
+                lines = full_message["content"].split("\n")
+                extracted_calls = []
+                import random
+                for line in lines:
+                    if "run_shell_command" in line:
+                        cmd = ""
+                        # Try to parse python-style: run_shell_command("ls") or run_shell_command(command="ls")
+                        func_match = re.search(r'run_shell_command\s*\(\s*(?:command\s*=\s*)?["\'](.*?)["\']\s*\)', line)
+                        if func_match:
+                            cmd = func_match.group(1)
+                        else:
+                            # Extract everything after the tool name as a raw string
+                            cmd_raw = line.split("run_shell_command", 1)[1].strip()
+                            cmd = cmd_raw.strip('"`\',[]{}()<>:') # Strip noise
+                            
+                        if cmd:
+                            extracted_calls.append({
+                                "id": f"call_{random.randint(1000, 9999)}",
+                                "function": {
+                                    "name": "run_shell_command",
+                                    "arguments": json.dumps({"command": cmd})
+                                }
+                            })
+                if extracted_calls:
+                    full_message["tool_calls"] = extracted_calls
+                    # Scrub the content field to prevent Ollama from choking on markdown hallucinations
+                    # Since we extracted tools, the content for this assistant message must be null or clean
+                    full_message["content"] = ""
+                        
+            return full_message
+            
+    except Exception as e:
+        if spinner:
+            spinner.stop()
+        print(f"\n\033[31m  Chat Error: {e}\033[0m")
+        return None
+
+def mode_ask(query):
+    entries = load_context()
+    dirmap = load_dirmap()
+    ctx = context_summary(entries, dirmap)
+
+    system = (
+        "You are an AI assistant in a terminal. "
+        "Answer concisely in plain text. No markdown, no bullet points with links, no formatting. "
+        "You have the user's session context below.\n\n" + ctx
+    )
+
+    # Use search for knowledge questions
+    search_results = call_search(query)
+    if search_results:
+        system += f"\n\nWeb search results:\n{search_results}"
+
+    spinner = Spinner().start()
+    stream_ollama(query, system, spinner=spinner)
+    spinner.stop()
+
+
+def mode_cmd(query):
+    entries = load_context()
+    dirmap = load_dirmap()
+    ctx = context_summary(entries, dirmap)
+
+    system = (
+        "You are a command generator for a macOS zsh terminal. "
+        "Given a request, respond with ONLY the shell command. "
+        "ONE LINE ONLY. No explanation, no comments, no markdown, no backticks. "
+        "Just the raw command. "
+        "Use FULL ABSOLUTE PATHS from the context. Never guess paths. "
+        "The current working directory is shown in the recent commands.\n\n" + ctx
+    )
+
+    # For navigation requests, search the filesystem for matching directories
+    nav_words = ["move", "go", "cd", "navigate", "open", "switch", "change dir", "folder", "directory", "dir"]
+    if any(w in query.lower() for w in nav_words):
+        # Extract the target name from the query (last meaningful word)
+        skip = {"to", "the", "my", "a", "in", "into", "dir", "directory", "folder", "please"}
+        target_words = [w for w in query.lower().split() if w not in skip and w not in nav_words]
+        if target_words:
+            search_term = target_words[-1]
+            try:
+                # Use macOS Spotlight (mdfind) for instant directory lookups
+                result = subprocess.run(
+                    ["mdfind", "-onlyin", os.path.expanduser("~"), 
+                     f"kMDItemFSName == '*{search_term}*'c && kMDItemContentType == 'public.folder'"],
+                    capture_output=True, text=True, timeout=5
+                )
+                
+                # Filter out Library and hidden folders, take top 10
+                all_matches = result.stdout.strip().split("\n")
+                matches = [p for p in all_matches if p and "/Library/" not in p and "/." not in p][:10]
+                
+                if matches:
+                    system += "\n\nMatching directories found on filesystem:\n"
+                    for m in matches:
+                        system += f"  {m}\n"
+            except Exception:
+                pass
+
+    spinner = Spinner().start()
+    response = stream_ollama(query, system, spinner=spinner)
+    spinner.stop()
+    
+    # Extract only the first non-empty line as the command
+    cmd = ""
+    for line in response.strip().split("\n"):
+        line = line.strip().strip("`").strip()
+        if line and not line.startswith("#") and not line.startswith("//"):
+            cmd = line
+            break
+
+    if cmd:
+        if cmd.startswith("ERROR"):
+            print(f"\n\033[31m  {cmd}\033[0m")
+            return
+        print(f"\n\033[33m  ⏎ Enter to run, any other key to cancel\033[0m", end="", flush=True)
+        try:
+            import tty, termios
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if ch in ('\r', '\n'):
+                print(f"\n\033[90m  → {cmd}\033[0m\n")
+                # Write to temp file for shell wrapper to eval (so cd etc. work)
+                cmd_file = os.path.join(CTX_DIR, ".ai_cmd")
+                with open(cmd_file, "w") as f:
+                    f.write(cmd)
+            else:
+                print("\n\033[90m  cancelled\033[0m")
+        except Exception:
+            pass
+
+
+def mode_fix():
+    entries = load_context()
+    dirmap = load_dirmap()
+
+    failed = None
+    for e in reversed(entries):
+        if e.get("exit", 0) != 0:
+            failed = e
+            break
+
+    if not failed:
+        print("\033[90m  No recent failed commands.\033[0m")
+        return
+
+    ctx = context_summary(entries, dirmap)
+    cmd = failed.get("cmd", "")
+    exit_code = failed.get("exit", 1)
+
+    system = (
+        "You are a debugging assistant. The user's last command failed. "
+        "Explain what went wrong briefly (1-2 sentences) then give the corrected command. "
+        "No markdown. Plain text only.\n\n" + ctx
+    )
+
+    search_results = call_search(f"{cmd} error exit code {exit_code}")
+    if search_results:
+        system += f"\n\nWeb results:\n{search_results}"
+
+    prompt = f"Command `{cmd}` failed (exit {exit_code}). Fix it."
+
+    print(f"\033[90m  analyzing `{cmd}`\033[0m")
+    spinner = Spinner().start()
+    stream_ollama(prompt, system, spinner=spinner)
+    spinner.stop()
+
+
+def mode_agent(query):
+    """Autonomous ReAct agent loop using native tool calling."""
+    entries = load_context()
+    dirmap = load_dirmap()
+    ctx = context_summary(entries, dirmap)
+
+    system = (
+        "You are an autonomous Senior Software Engineer operating in a macOS zsh terminal. "
+        "You have access to a tool called `run_shell_command`. "
+        "CRITICAL INSTRUCTION: To execute a command, read a file, or search, you MUST use the `run_shell_command` tool. "
+        "DO NOT just type out markdown code blocks. You MUST call the tool via the provided JSON schema. "
+        "When given a task, call the tool, analyze the resulting output, and keep calling the tool until the task is complete. "
+        "When the task is completely finished, and only then, output a final plaintext response without calling any tools. "
+        "Your environment context:\n\n" + ctx
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Task: " + query}
+    ]
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": "Execute a bash/zsh command on the macOS terminal and get its output. Use this to read files (cat), list directories (ls), search (grep), or execute anything else.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The strict shell command to execute."
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    }]
+
+    print(f"\033[90m  agent loop:\033[0m {query}\n")
+
+    max_loops = 15
+    for loop in range(max_loops):
+        spinner = Spinner().start()
+        response_msg = chat_ollama(messages, tools=tools, spinner=spinner)
+        spinner.stop()
+        
+        if not response_msg:
+            break
+            
+        messages.append(response_msg)
+        
+        # If no tool calls, it means the agent finished its reasoning and output text
+        if "tool_calls" not in response_msg or not response_msg["tool_calls"]:
+            break
+
+        # Execute each tool call
+        for tool_call in response_msg["tool_calls"]:
+            if tool_call.get("function", {}).get("name") == "run_shell_command":
+                args_str = tool_call["function"].get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    cmd = args.get("command", "")
+                    
+                    print(f"\033[36m  $ {cmd}\033[0m")
+                    
+                    # Execute
+                    result = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True, timeout=30
+                    )
+                    
+                    # Truncate output to prevent blowing up the context window
+                    out = result.stdout
+                    err = result.stderr
+                    if len(out) > 3000: out = out[:1500] + "\n...[TRUNCATED]...\n" + out[-1500:]
+                    if len(err) > 3000: err = err[:1500] + "\n...[TRUNCATED]...\n" + err[-1500:]
+                    
+                    full_out = out + ("\nError:\n" + err if err else "")
+                    if not full_out.strip():
+                        full_out = "[Command executed empty output]"
+                        
+                    print(f"\033[90m  {full_out.strip()[:100]}...\033[0m\n")
+                    
+                    messages.append({
+                        "role": "tool",
+                        "content": full_out,
+                        "tool_call_id": tool_call.get("id", "legacy_call")
+                    })
+                except Exception as e:
+                    print(f"\033[31m  Tool Error: {e}\033[0m")
+                    messages.append({"role": "tool", "content": f"Error: {e}", "tool_call_id": tool_call.get("id", "legacy_call")})
+
+def mode_ingest():
+    """Background ingestion to keep Ollama KV cache warm."""
+    entries = load_context()
+    dirmap = load_dirmap()
+    ctx = context_summary(entries, dirmap)
+
+    # Use the exact same system prompt as -ask to ensure KV cache hit
+    system = (
+        "You are an AI assistant in a terminal. "
+        "Answer concisely in plain text. No markdown, no bullet points with links, no formatting. "
+        "You have the user's session context below.\n\n" + ctx
+    )
+
+    payload = json.dumps({
+        "model": MODEL,
+        "prompt": " ",  # Minimal prompt
+        "system": system,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 1},
+        "keep_alive": "10m"
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pass
+    except Exception:
+        pass
+
+
+def mode_ctx():
+    entries = load_context()
+    dirmap = load_dirmap()
+
+    print("\033[1;37m  AI Context\033[0m")
+    
+    if os.environ.get("DT_AI_ENABLED", "0") == "0":
+        print("\033[31m  [PAUSED] AI context tracking is currently OFF. Run `ai -on` to enable.\033[0m")
+        
+    print(f"\033[90m  {'─' * 40}\033[0m")
+
+    if dirmap:
+        print(f"\033[36m  Project: {dirmap.get('path', 'unknown')}\033[0m")
+        tree = format_tree(dirmap)
+        for line in tree.split("\n")[:20]:
+            if line.strip():
+                print(f"\033[90m  {line}\033[0m")
+        print()
+
+    if entries:
+        print(f"\033[36m  Last {len(entries)} commands:\033[0m")
+        for e in entries[-10:]:
+            status = "\033[32m✓\033[0m" if e.get("exit", 0) == 0 else "\033[31m✗\033[0m"
+            cmd = e.get("cmd", "")
+            cwd = os.path.basename(e.get("cwd", ""))
+            print(f"  {status} \033[90m{cwd}$\033[0m {cmd}")
+    else:
+        print("\033[90m  No commands captured yet. Run some commands first.\033[0m")
+
+    print(f"\n\033[90m  {'─' * 40}\033[0m")
+    print(f"\033[90m  Model: {MODEL} via Ollama\033[0m")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("\033[36mUsage:\033[0m")
+        print("  ai -ask <question>   \033[90mAsk a question about your recent terminal session.\033[0m")
+        print("  ai -cmd <goal>       \033[90mGenerate a shell command and execute it.\033[0m")
+        print("  ai -fix              \033[90mAnalyze the last failed command and suggest a fix.\033[0m")
+        print("  ai -agent <task>     \033[90mLoop a powerful local agent to autonomously research or fix an issue.\033[0m")
+        print("  ai -off / -on        \033[90mToggle background context tracking and LLM cache warming.\033[0m")
+        print("  ai -ctx              \033[90mShow current context.\033[0m")
+        print("  ai -ingest           \033[90m(Internal) Update background context.\033[0m")
+        print("  ai <question>        \033[90mSame as -ask.\033[0m")
+        sys.exit(1)
+
+    tag = sys.argv[1]
+    query = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+
+    if tag == "-ask":
+        if not query:
+            print("\033[31m  Usage: ai -ask \"your question\"\033[0m")
+            sys.exit(1)
+        mode_ask(query)
+    elif tag == "-cmd":
+        if not query:
+            print("\033[31m  Usage: ai -cmd \"what to do\"\033[0m")
+            sys.exit(1)
+        mode_cmd(query)
+    elif tag == "-fix":
+        mode_fix()
+    elif tag == "-agent":
+        if not query:
+            print("\033[31m  Usage: ai -agent \"your complex task\"\033[0m")
+            sys.exit(1)
+        mode_agent(query)
+    elif tag == "-ctx":
+        mode_ctx()
+    elif tag == "-ingest":
+        mode_ingest()
+    else:
+        query = " ".join(sys.argv[1:])
+        mode_ask(query)
+
+
+if __name__ == "__main__":
+    main()

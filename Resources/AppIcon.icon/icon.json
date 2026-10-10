@@ -1,0 +1,50 @@
+{
+  "fill" : {
+    "automatic-gradient" : "extended-srgb:0.00000,0.53333,1.00000,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "dt__.png",
+          "name" : "dt__",
+          "position" : {
+            "scale" : 0.29,
+            "translation-in-points" : [
+              -8.187370731961892,
+              -134.42774931279268
+            ]
+          }
+        },
+        {
+          "blend-mode" : "normal",
+          "fill" : "automatic",
+          "image-name" : "Rectangle 29.png",
+          "name" : "Rectangle 29",
+          "position" : {
+            "scale" : 0.7,
+            "translation-in-points" : [
+              449.14631012794234,
+              921.6
+            ]
+          }
+        }
+      ],
+      "name" : "Untitled-2",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

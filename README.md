@@ -21,7 +21,7 @@ assume a fixed character grid.
 ## Build
 
 ```sh
-git clone --recurse-submodules https://github.com/HumanLemming996/Dexter.git
+git clone --recurse-submodules https://github.com/bhuvchal/Dexter.git
 cd Dexter
 ./bundle.sh            # builds a release binary and opens DynamicTerminal.app
 ```

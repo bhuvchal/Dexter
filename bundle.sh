@@ -20,9 +20,10 @@ mkdir -p "$RESOURCES_DIR"
 # Copy binary
 cp ".build/release/$APP_NAME" "$MACOS_DIR/$APP_NAME"
 
-# Copy bundled scripts (ai, search, context_hook.zsh) into Resources so they
+# Copy bundled scripts into Resources so they
 # are on PATH automatically when the terminal spawns a shell.
-for script in Scripts/ai Scripts/search Scripts/context_hook.zsh; do
+# The AI helpers (Scripts/ai, Scripts/context_hook.zsh) are disabled for now.
+for script in Scripts/search; do
     if [ -f "$script" ]; then
         cp "$script" "$RESOURCES_DIR/$(basename "$script")"
         chmod +x "$RESOURCES_DIR/$(basename "$script")"

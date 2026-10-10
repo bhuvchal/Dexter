@@ -45,23 +45,10 @@ fonts, sizes, line height, and the 16-colour ANSI palette.
 
 If the configured proportional font isn't installed, the system font is used.
 
-## Optional: local AI helpers
+## Extras
 
-The app puts a few scripts on `PATH` inside its shells:
-
-- `search <query>` — web results in the terminal
-- `ai "question"`, `ai -cmd "task"`, `ai -fix` — answers and commands from a local
-  model via [Ollama](https://ollama.com) (`mistral` by default)
-
-Context tracking is **off by default**. To use it, add this to `~/.zshrc`:
-
-```sh
-[[ -n "$DT_RESOURCES" ]] && source "$DT_RESOURCES/context_hook.zsh"
-```
-
-Then run `ai -on` in a session. That starts Ollama if needed and begins logging
-recent commands to `~/.dynamicterminal/` so `ai` has context. `ai -off` stops it.
-Nothing leaves your machine except `search` queries (sent to DuckDuckGo), which `ai` may also make on your behalf.
+`search <query>` is on `PATH` inside the app's shells and prints web results
+(via DuckDuckGo) right in the terminal.
 
 ## License
 

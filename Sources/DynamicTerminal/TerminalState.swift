@@ -163,7 +163,7 @@ class TerminalState {
             }
         }
         
-        // Spawn PTY — pass Resources path so bundled scripts (ai, search) are on PATH
+        // Spawn PTY — pass Resources path so bundled scripts (search) are on PATH
         let resourcesPath = Bundle.main.resourcePath
         pid = spawn_pty(&ptyFD, 24, 80, resourcesPath)
         if pid > 0 {

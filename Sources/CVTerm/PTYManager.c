@@ -17,7 +17,7 @@ int spawn_pty(int *master_fd, int rows, int cols, const char *extra_path) {
     setenv("TERM", "xterm-256color", 1);
 
     // Prepend the app's resources directory to PATH so bundled scripts
-    // (ai, search, context_hook.zsh) are discoverable without manual setup.
+    // (e.g. search) are discoverable without manual setup.
     if (extra_path) {
       const char *current = getenv("PATH");
       char new_path[8192];
@@ -26,7 +26,7 @@ int spawn_pty(int *master_fd, int rows, int cols, const char *extra_path) {
       else
         snprintf(new_path, sizeof(new_path), "%s", extra_path);
       setenv("PATH", new_path, 1);
-      // Also expose the path so context_hook.zsh can reference bundled tools.
+      // Also expose the path so shell hooks can reference bundled tools.
       setenv("DT_RESOURCES", extra_path, 1);
     }
 

@@ -470,6 +470,7 @@ class TerminalState {
         count: Int,
         font: NSFont,
         isMono: Bool,
+        alignColumns: Bool = false,
         defaultColor: NSColor,
         colWidth: CGFloat
     ) -> (line: NSMutableAttributedString, tabStops: [NSTextTab], colToIndex: [Int]) {
@@ -509,13 +510,33 @@ class TerminalState {
                 }
                 let spaces = j - i
 
-                if !isMono && spaces >= 3 {
+                // On table-like lines every word is pinned to its terminal column.
+                var token = ""
+                var tokenEnd = j
+                if alignColumns {
+                    while tokenEnd < count {
+                        let next = cellProvider(tokenEnd)
+                        if isBlankCell(next) { break }
+                        token.unicodeScalars.append(UnicodeScalar(next.chars.0)!)
+                        tokenEnd += 1
+                    }
+                }
+                // Leading indentation keeps its usual handling, except right-aligned numbers.
+                let anchorToken = !token.isEmpty && (i > 0 || isNumericToken(token))
+
+                if !isMono && (spaces >= 3 || anchorToken) {
                     // Proportional-font only: collapse multi-space runs to a tab stop at the
                     // correct column position. This simulates fixed-width column alignment.
                     // NEVER apply to mono lines — mono spaces are already exact width.
+                    // Numbers in tables are right-aligned (ls sizes, dates, PIDs), so they're
+                    // pinned by the column where they end rather than where they start.
                     flush()
                     for k in i..<j { colToIndex[k] = result.length }
-                    tabStops.append(NSTextTab(textAlignment: .left, location: CGFloat(j) * colWidth))
+                    if anchorToken && isNumericToken(token) {
+                        tabStops.append(NSTextTab(textAlignment: .right, location: CGFloat(tokenEnd) * colWidth))
+                    } else {
+                        tabStops.append(NSTextTab(textAlignment: .left, location: CGFloat(j) * colWidth))
+                    }
                     result.append(NSAttributedString(string: "\t", attributes: runAttributes))
                 } else {
                     for k in 0..<spaces { colToIndex[i + k] = result.length + runLength + k }
@@ -549,6 +570,48 @@ class TerminalState {
 
         colToIndex[count] = result.length
         return (result, tabStops, colToIndex)
+    }
+
+    // Table-like output (ls -l, ps, df) pads columns with spaces. A line with two or more
+    // gaps of 2+ spaces between words gets its words pinned to terminal columns so rows line
+    // up in the proportional font. Prose with an occasional double space, and code after a
+    // single indent or line-number gap (e.g. in vim), is left alone.
+    private func looksTabular(_ line: String) -> Bool {
+        var gaps = 0
+        var spaces = 0
+        var seenText = false
+        for ch in line {
+            if ch == " " {
+                spaces += 1
+            } else {
+                if seenText && spaces >= 2 { gaps += 1 }
+                seenText = true
+                spaces = 0
+            }
+        }
+        return gaps >= 2
+    }
+
+    // Sizes, counts, dates and times: "224", "4.0K", "460Gi", "13:02", "2026", "12%".
+    private func isNumericToken(_ token: String) -> Bool {
+        var hasDigit = false
+        var unitLength = 0
+        for (index, ch) in token.enumerated() {
+            if unitLength > 0 {
+                // A unit suffix like "K", "Gi" or "%" must end the token.
+                guard unitLength < 2, "iBb".contains(ch) else { return false }
+                unitLength += 1
+            } else if ch.isASCII && ch.isNumber {
+                hasDigit = true
+            } else if ".,:".contains(ch) || (index == 0 && "+-".contains(ch)) {
+                continue
+            } else if hasDigit && "%KMGTPBkb".contains(ch) {
+                unitLength = 1
+            } else {
+                return false
+            }
+        }
+        return hasDigit
     }
 
     // Returns a paragraph style that locks every line to the same height regardless of
@@ -601,6 +664,7 @@ class TerminalState {
         }
 
         let isMono = hasBoxDrawing || inCodeBlock
+        let alignColumns = !isMono && looksTabular(rawLine)
         let lineFont = isMono ? monoFont : propFont
 
         let (archivedLine, tabStops, _) = buildLine(
@@ -608,6 +672,7 @@ class TerminalState {
             count: actualCount,
             font: lineFont,
             isMono: isMono,
+            alignColumns: alignColumns,
             defaultColor: defaultTextColor,
             colWidth: colWidth
         )
@@ -745,6 +810,7 @@ class TerminalState {
             }
 
             let isMono = hasBoxDrawing || gridInCodeBlock
+            let alignColumns = !isMono && looksTabular(rawLine)
             let lineFont = isMono ? monoFont : propFont
 
             let (processedLineAttrs, lineTabStops, colToIndex) = buildLine(
@@ -756,6 +822,7 @@ class TerminalState {
                 count: actualLineCount,
                 font: lineFont,
                 isMono: isMono,
+                alignColumns: alignColumns,
                 defaultColor: defaultTextColor,
                 colWidth: colWidth
             )
@@ -767,7 +834,15 @@ class TerminalState {
                 foundCursor = true
             }
 
-            if trimCol >= vtermCols - 2 && trimCol > 0 && r != cursor.row && !isPureBorderLine && !isAlternateBuffer {
+            // libvterm marks rows that continue an auto-wrapped line; guessing from the line
+            // reaching the right edge glued unrelated full-width lines together.
+            var nextRowContinues = false
+            if r + 1 < vtermRows, let state = vterm_obtain_state(vterm),
+               let info = vterm_state_get_lineinfo(state, r + 1) {
+                nextRowContinues = info.pointee.continuation != 0
+            }
+
+            if nextRowContinues && r != cursor.row && !isPureBorderLine && !isAlternateBuffer {
                 // Soft wrap — only for genuine long text lines that the shell wrapped.
                 // Pure border lines (╭────╮, ╰────╯) also fill the width but must
                 // always hard-break so they never merge with the next line's prompt.

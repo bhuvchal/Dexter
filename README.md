@@ -3,8 +3,8 @@
 A native macOS terminal that reads like a document.
 
 Normal output is set in a proportional serif with generous line spacing. Anything
-that needs a grid — code fences, box-drawing panels, full-screen apps — switches to
-monospace automatically, so tables and TUIs stay aligned.
+that needs a grid — code fences and box-drawing panels — switches to monospace
+automatically, so they stay aligned.
 
 <p align="center"><img src="Resources/AppIcon-1024.png" width="128" alt="Dynamic Terminal icon"></p>
 

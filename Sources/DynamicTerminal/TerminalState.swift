@@ -551,25 +551,6 @@ class TerminalState {
         return (result, tabStops, colToIndex)
     }
 
-    // Tables (ls -l, ps, df, docker ps, ...) pad columns with runs of spaces, often
-    // right-aligned, which tab stops can't reproduce in a proportional font. A line with
-    // two or more gaps of 2+ spaces between words is treated as tabular and set in mono.
-    private func looksTabular(_ line: String) -> Bool {
-        var gaps = 0
-        var spaces = 0
-        var seenText = false
-        for ch in line {
-            if ch == " " {
-                spaces += 1
-            } else {
-                if seenText && spaces >= 2 { gaps += 1 }
-                seenText = true
-                spaces = 0
-            }
-        }
-        return gaps >= 2
-    }
-
     // Returns a paragraph style that locks every line to the same height regardless of
     // whether it renders in the proportional or mono font. Mixing font line heights on
     // adjacent lines causes visual jumping in Claude Code / LLM CLI output.
@@ -619,7 +600,7 @@ class TerminalState {
             inCodeBlock.toggle()
         }
 
-        let isMono = hasBoxDrawing || inCodeBlock || looksTabular(rawLine)
+        let isMono = hasBoxDrawing || inCodeBlock
         let lineFont = isMono ? monoFont : propFont
 
         let (archivedLine, tabStops, _) = buildLine(
@@ -763,8 +744,7 @@ class TerminalState {
                 continue
             }
 
-            // Full-screen apps (vim, less, htop) address cells by column, so they get the grid.
-            let isMono = isAlternateBuffer || hasBoxDrawing || gridInCodeBlock || looksTabular(rawLine)
+            let isMono = hasBoxDrawing || gridInCodeBlock
             let lineFont = isMono ? monoFont : propFont
 
             let (processedLineAttrs, lineTabStops, colToIndex) = buildLine(

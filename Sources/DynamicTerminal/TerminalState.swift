@@ -95,12 +95,47 @@ class TerminalState {
     var renderTimer: Timer?
     private var pendingData = Data()
     private let pendingDataMutex = NSLock()
+    // Main-thread side of the hand-off: bytes taken from pendingData, consumed in slices.
+    private var inputBuffer = Data()
+    private var inputOffset = 0
+    // Bytes read from the PTY but not yet fed to libvterm (guarded by pendingDataMutex).
+    private var queuedBytes = 0
+    private let maxQueuedBytes = 1 << 20
+    private var lastRenderTime: TimeInterval = 0
     
     // Cached link detector (expensive to create on every keystroke)
     private lazy var linkDetector: NSDataDetector? = {
         try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
     }()
     
+    // Fonts and metrics are expensive to look up per line; rebuilt when resize() runs,
+    // which also happens on every config change.
+    private struct RenderMetrics {
+        let propFont: NSFont
+        let monoFont: NSFont
+        let textColor: NSColor
+        let colWidth: CGFloat
+        let lineHeight: CGFloat
+    }
+    private var cachedMetrics: RenderMetrics?
+    private var metrics: RenderMetrics {
+        if let cachedMetrics { return cachedMetrics }
+        let config = TerminalConfig.current
+        let propFont = NSFont(name: config.proportionalFontName, size: config.proportionalFontSize)
+            ?? NSFont.systemFont(ofSize: config.proportionalFontSize)
+        let monoFont = NSFont(name: config.monoFontName, size: config.monoFontSize)
+            ?? NSFont.monospacedSystemFont(ofSize: config.monoFontSize, weight: .regular)
+        let built = RenderMetrics(
+            propFont: propFont,
+            monoFont: monoFont,
+            textColor: config.textColor,
+            colWidth: config.columnWidth,
+            lineHeight: NSLayoutManager().defaultLineHeight(for: propFont) * config.lineHeightMultiple
+        )
+        cachedMetrics = built
+        return built
+    }
+
     // Scrollback Archive
     var archiveBuffer = NSMutableAttributedString()
     var lastArchiveLength = 0
@@ -139,29 +174,40 @@ class TerminalState {
         renderTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             
-            // First, pull a FIXED MAX QUOTA of data from the background thread to prevent
-            // starving the main UI runloop if 100MB of data suddenly arrives
-            var dataToProcess = Data()
-            let maxBytesPerFrame = 65536 // Max 64KB per 16ms tick (~3.8 MB/s stream rate)
-            
-            self.pendingDataMutex.lock()
-            if !self.pendingData.isEmpty {
-                let bytesToTake = min(self.pendingData.count, maxBytesPerFrame)
-                dataToProcess = self.pendingData.prefix(bytesToTake)
-                self.pendingData.removeFirst(bytesToTake)
+            // First, feed libvterm in small slices for at most ~12ms per tick, so key events
+            // (e.g. Ctrl-C) are still handled during a flood. A fixed 64KB chunk could take
+            // ~200ms to process once scrollback archiving is included.
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.012
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if self.inputOffset >= self.inputBuffer.count {
+                    // Take everything the reader thread has queued in one O(1) swap.
+                    self.pendingDataMutex.lock()
+                    self.inputBuffer = self.pendingData
+                    self.pendingData = Data()
+                    self.pendingDataMutex.unlock()
+                    self.inputOffset = 0
+                    if self.inputBuffer.isEmpty { break }
+                }
+                let start = self.inputBuffer.startIndex + self.inputOffset
+                let length = min(4096, self.inputBuffer.count - self.inputOffset)
+                self.inputBuffer[start..<(start + length)].withUnsafeBytes { ptr in
+                    _ = vterm_input_write(self.vterm, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), length)
+                }
+                self.inputOffset += length
+                self.pendingDataMutex.lock()
+                self.queuedBytes -= length
+                self.pendingDataMutex.unlock()
                 self.needsRender = true
             }
-            self.pendingDataMutex.unlock()
             
-            if !dataToProcess.isEmpty {
-                dataToProcess.withUnsafeBytes { ptr in
-                    vterm_input_write(self.vterm, ptr.baseAddress?.assumingMemoryBound(to: CChar.self), dataToProcess.count)
-                }
-            }
-            
-            // Second, if the state has changed, render the updated buffers to the screen
-            if self.needsRender {
+            // Second, if the state has changed, render the updated buffers to the screen.
+            // While input is still backed up, redraw ~10x a second instead of every tick:
+            // repainting the window dominated the cost of heavy output.
+            let backlogged = self.inputOffset < self.inputBuffer.count
+            let now = ProcessInfo.processInfo.systemUptime
+            if self.needsRender && (!backlogged || now - self.lastRenderTime >= 0.1) {
                 self.needsRender = false
+                self.lastRenderTime = now
                 self.renderProportional()
             }
         }
@@ -215,6 +261,17 @@ class TerminalState {
             defer { buffer.deallocate() }
             
             while true {
+                // Backpressure: stop reading while the main thread is far behind. The kernel's
+                // PTY buffer then fills and the writer (e.g. `yes`) blocks, instead of this
+                // queue growing without bound and Ctrl-C output arriving after the backlog.
+                while true {
+                    self.pendingDataMutex.lock()
+                    let queued = self.queuedBytes
+                    self.pendingDataMutex.unlock()
+                    if queued < self.maxQueuedBytes { break }
+                    usleep(2000)
+                }
+
                 let bytesRead = read_pty(self.ptyFD, buffer, bufferSize)
                 if bytesRead > 0 {
                     let data = Data(bytes: buffer, count: bytesRead)
@@ -223,6 +280,7 @@ class TerminalState {
                     // This creates massive backpressure relief and prevents GCD thread flooding
                     self.pendingDataMutex.lock()
                     self.pendingData.append(data)
+                    self.queuedBytes += data.count
                     self.pendingDataMutex.unlock()
                 } else {
                     print("PTY closed or error reading")
@@ -237,12 +295,9 @@ class TerminalState {
         let usableWidth = max(0, boundsSize.width - 60)   // 30pt horizontal inset * 2
         let usableHeight = max(0, boundsSize.height - 80)  // 40pt vertical inset * 2
 
-        let colWidth = TerminalConfig.current.columnWidth
-        let font = NSFont(name: TerminalConfig.current.proportionalFontName,
-                          size: TerminalConfig.current.proportionalFontSize)
-            ?? NSFont.systemFont(ofSize: TerminalConfig.current.proportionalFontSize)
-        let layoutManager = NSLayoutManager()
-        let lineHeight = layoutManager.defaultLineHeight(for: font) * TerminalConfig.current.lineHeightMultiple
+        cachedMetrics = nil
+        let colWidth = metrics.colWidth
+        let lineHeight = metrics.lineHeight
 
         // Subtract 2 cols as a safety margin: box-drawing chars in most mono fonts are
         // fractionally wider than an 'M' (what columnWidth measures), so rounding
@@ -344,6 +399,72 @@ class TerminalState {
     // Converts a row of VTermScreenCells into an NSAttributedString.
     // isMono = true: spaces are literal (mono font handles alignment natively).
     // isMono = false: runs of 3+ spaces become NSTextTab stops (proportional font alignment trick).
+    // Cells with the same style are appended as one run; per-character attributed strings
+    // made heavy output slow.
+    private struct CellStyle: Equatable {
+        let fg: UInt32
+        let bg: UInt32
+        let flags: UInt8
+
+        init(_ cell: VTermScreenCell) {
+            fg = CellStyle.pack(cell.fg)
+            bg = CellStyle.pack(cell.bg)
+            var f: UInt8 = 0
+            if cell.attrs.bold != 0 { f |= 1 }
+            if cell.attrs.italic != 0 { f |= 2 }
+            if cell.attrs.underline != 0 { f |= 4 }
+            if cell.attrs.strike != 0 { f |= 8 }
+            if cell.attrs.reverse != 0 { f |= 16 }
+            flags = f
+        }
+
+        private static func pack(_ c: VTermColor) -> UInt32 {
+            UInt32(c.type) | UInt32(c.rgb.red) << 8 | UInt32(c.rgb.green) << 16 | UInt32(c.rgb.blue) << 24
+        }
+    }
+
+    // Blank cells with a background (status bars, highlighted rows) are visible content
+    // and must not be trimmed off the end of a line.
+    private func hasVisibleBackground(_ cell: VTermScreenCell) -> Bool {
+        return cell.attrs.reverse != 0 || (cell.bg.type & 0x04) == 0
+    }
+
+    private func isBlankCell(_ cell: VTermScreenCell) -> Bool {
+        let ch = cell.chars.0
+        return ch == 0 || ch == 32 || UnicodeScalar(ch) == nil
+    }
+
+    private func attributes(for cell: VTermScreenCell, font: NSFont, defaultColor: NSColor) -> [NSAttributedString.Key: Any] {
+        var fgColor = getNSColor(from: cell.fg, isFg: true) ?? defaultColor
+        var bgColor = getNSColor(from: cell.bg, isFg: false)
+
+        if cell.attrs.reverse != 0 {
+            let temp = fgColor
+            fgColor = bgColor ?? TerminalConfig.current.backgroundColor
+            bgColor = temp
+        }
+
+        var currentFont = font
+        if cell.attrs.bold != 0 || cell.attrs.italic != 0 {
+            var traits: NSFontDescriptor.SymbolicTraits = []
+            if cell.attrs.bold != 0 { traits.insert(.bold) }
+            if cell.attrs.italic != 0 { traits.insert(.italic) }
+            let newDescriptor = currentFont.fontDescriptor.withSymbolicTraits(traits)
+            if let newFont = NSFont(descriptor: newDescriptor, size: currentFont.pointSize) {
+                currentFont = newFont
+            }
+        }
+
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: currentFont,
+            .foregroundColor: fgColor
+        ]
+        if let bg = bgColor { attributes[.backgroundColor] = bg }
+        if cell.attrs.underline != 0 { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+        if cell.attrs.strike != 0 { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+        return attributes
+    }
+
     private func buildLine(
         cellProvider: (Int) -> VTermScreenCell,
         count: Int,
@@ -351,101 +472,113 @@ class TerminalState {
         isMono: Bool,
         defaultColor: NSColor,
         colWidth: CGFloat
-    ) -> (line: NSMutableAttributedString, tabStops: [NSTextTab], colToIndex: [Int: Int]) {
+    ) -> (line: NSMutableAttributedString, tabStops: [NSTextTab], colToIndex: [Int]) {
         let result = NSMutableAttributedString()
         var tabStops: [NSTextTab] = []
-        var colToIndex = [Int: Int]()
+        var colToIndex = [Int](repeating: 0, count: count + 1)
+
+        var run = ""
+        var runLength = 0  // UTF-16 length of `run`
+        var runStyle: CellStyle?
+        var runAttributes: [NSAttributedString.Key: Any] = [:]
+        func flush() {
+            guard !run.isEmpty else { return }
+            result.append(NSAttributedString(string: run, attributes: runAttributes))
+            run = ""
+            runLength = 0
+        }
 
         var i = 0
         while i < count {
-            colToIndex[i] = result.length
-
             let cell = cellProvider(i)
-            let cChar = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
-
-            var fgColor = getNSColor(from: cell.fg, isFg: true) ?? defaultColor
-            var bgColor = getNSColor(from: cell.bg, isFg: false)
-
-            if cell.attrs.reverse != 0 {
-                let temp = fgColor
-                fgColor = bgColor ?? TerminalConfig.current.backgroundColor
-                bgColor = temp
+            let style = CellStyle(cell)
+            if style != runStyle {
+                flush()
+                runStyle = style
+                runAttributes = attributes(for: cell, font: font, defaultColor: defaultColor)
             }
 
-            var currentFont = font
-            if cell.attrs.bold != 0 || cell.attrs.italic != 0 {
-                var traits: NSFontDescriptor.SymbolicTraits = []
-                if cell.attrs.bold != 0 { traits.insert(.bold) }
-                if cell.attrs.italic != 0 { traits.insert(.italic) }
-                let newDescriptor = currentFont.fontDescriptor.withSymbolicTraits(traits)
-                if let newFont = NSFont(descriptor: newDescriptor, size: currentFont.pointSize) {
-                    currentFont = newFont
-                }
-            }
-
-            var attributes: [NSAttributedString.Key: Any] = [
-                .font: currentFont,
-                .foregroundColor: fgColor
-            ]
-            if let bg = bgColor { attributes[.backgroundColor] = bg }
-            if cell.attrs.underline != 0 { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-            if cell.attrs.strike != 0 { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
-
-            if cChar == " " {
-                var spaces = 0
-                var j = i
+            if isBlankCell(cell) {
+                // Gather the run of same-styled blanks, so e.g. reverse-video spaces in a
+                // status bar keep their background instead of taking the first cell's style.
+                var j = i + 1
                 while j < count {
-                    let nextCell = cellProvider(j)
-                    let nextCharVal = nextCell.chars.0 != 0 ? Character(UnicodeScalar(nextCell.chars.0) ?? " ") : " "
-                    if nextCharVal == " " {
-                        colToIndex[j] = result.length
-                        spaces += 1
-                        j += 1
-                    } else { break }
+                    let next = cellProvider(j)
+                    guard isBlankCell(next), CellStyle(next) == style else { break }
+                    j += 1
                 }
+                let spaces = j - i
 
                 if !isMono && spaces >= 3 {
                     // Proportional-font only: collapse multi-space runs to a tab stop at the
                     // correct column position. This simulates fixed-width column alignment.
                     // NEVER apply to mono lines — mono spaces are already exact width.
-                    let tabLocation = CGFloat(j) * colWidth
-                    tabStops.append(NSTextTab(textAlignment: .left, location: tabLocation))
-                    result.append(NSAttributedString(string: "\t", attributes: attributes))
+                    flush()
+                    for k in i..<j { colToIndex[k] = result.length }
+                    tabStops.append(NSTextTab(textAlignment: .left, location: CGFloat(j) * colWidth))
+                    result.append(NSAttributedString(string: "\t", attributes: runAttributes))
                 } else {
-                    result.append(NSAttributedString(string: String(repeating: " ", count: spaces), attributes: attributes))
+                    for k in 0..<spaces { colToIndex[i + k] = result.length + runLength + k }
+                    run += String(repeating: " ", count: spaces)
+                    runLength += spaces
                 }
                 i = j
-            } else {
-                let displayedChar = mapSymbol(cChar)
-                if !isMono && cell.chars.0 != 0 && isFixedWidthChar(cell.chars.0) {
-                    // Pad symbol chars to column width only in proportional mode;
-                    // in mono mode the font's fixed advance width already handles this.
-                    let charStr = NSAttributedString(string: displayedChar, attributes: [.font: currentFont])
-                    let naturalWidth = charStr.size().width
-                    let padding = colWidth - naturalWidth
-                    if padding > 0 {
-                        attributes[.kern] = padding
-                    }
-                }
-                result.append(NSAttributedString(string: displayedChar, attributes: attributes))
-                i += 1
+                continue
             }
+
+            colToIndex[i] = result.length + runLength
+            let displayedChar = mapSymbol(Character(UnicodeScalar(cell.chars.0)!))
+            if !isMono && isFixedWidthChar(cell.chars.0) {
+                // Pad symbol chars to column width only in proportional mode;
+                // in mono mode the font's fixed advance width already handles this.
+                flush()
+                var symbolAttributes = runAttributes
+                let naturalWidth = NSAttributedString(string: displayedChar, attributes: [.font: runAttributes[.font] ?? font]).size().width
+                let padding = colWidth - naturalWidth
+                if padding > 0 {
+                    symbolAttributes[.kern] = padding
+                }
+                result.append(NSAttributedString(string: displayedChar, attributes: symbolAttributes))
+            } else {
+                run += displayedChar
+                runLength += displayedChar.utf16.count
+            }
+            i += 1
         }
+        flush()
 
         colToIndex[count] = result.length
         return (result, tabStops, colToIndex)
     }
 
+    // Tables (ls -l, ps, df, docker ps, ...) pad columns with runs of spaces, often
+    // right-aligned, which tab stops can't reproduce in a proportional font. A line with
+    // two or more gaps of 2+ spaces between words is treated as tabular and set in mono.
+    private func looksTabular(_ line: String) -> Bool {
+        var gaps = 0
+        var spaces = 0
+        var seenText = false
+        for ch in line {
+            if ch == " " {
+                spaces += 1
+            } else {
+                if seenText && spaces >= 2 { gaps += 1 }
+                seenText = true
+                spaces = 0
+            }
+        }
+        return gaps >= 2
+    }
+
     // Returns a paragraph style that locks every line to the same height regardless of
     // whether it renders in the proportional or mono font. Mixing font line heights on
     // adjacent lines causes visual jumping in Claude Code / LLM CLI output.
-    private func lockedLineStyle(tabStops: [NSTextTab], colWidth: CGFloat, propFont: NSFont) -> NSMutableParagraphStyle {
+    private func lockedLineStyle(tabStops: [NSTextTab], colWidth: CGFloat) -> NSMutableParagraphStyle {
         let pStyle = NSMutableParagraphStyle()
         pStyle.tabStops = tabStops
         pStyle.defaultTabInterval = colWidth
-        let baseHeight = NSLayoutManager().defaultLineHeight(for: propFont) * TerminalConfig.current.lineHeightMultiple
-        pStyle.minimumLineHeight = baseHeight
-        pStyle.maximumLineHeight = baseHeight
+        pStyle.minimumLineHeight = metrics.lineHeight
+        pStyle.maximumLineHeight = metrics.lineHeight
         return pStyle
     }
     
@@ -454,10 +587,11 @@ class TerminalState {
         guard let cells = cells else { return }
         if isAlternateBuffer { return }
         
-        let propFont = NSFont(name: TerminalConfig.current.proportionalFontName, size: TerminalConfig.current.proportionalFontSize) ?? NSFont.systemFont(ofSize: TerminalConfig.current.proportionalFontSize)
-        let monoFont = NSFont(name: TerminalConfig.current.monoFontName, size: TerminalConfig.current.monoFontSize) ?? NSFont.monospacedSystemFont(ofSize: TerminalConfig.current.monoFontSize, weight: .regular)
-        let defaultTextColor = TerminalConfig.current.textColor
-        let colWidth: CGFloat = TerminalConfig.current.columnWidth
+        let metrics = self.metrics
+        let propFont = metrics.propFont
+        let monoFont = metrics.monoFont
+        let defaultTextColor = metrics.textColor
+        let colWidth = metrics.colWidth
         
         // Find last non-empty column + detect box-drawing chars
         var lastNonEmptyCol = -1
@@ -465,7 +599,7 @@ class TerminalState {
         for c in 0..<Int(cols) {
             let cell = cells[c]
             let charVal = cell.chars.0 != 0 ? Character(UnicodeScalar(cell.chars.0) ?? " ") : " "
-            if charVal != " " && cell.chars.0 != 0 { lastNonEmptyCol = c }
+            if (charVal != " " && cell.chars.0 != 0) || hasVisibleBackground(cell) { lastNonEmptyCol = c }
             if !hasBoxDrawing && cell.chars.0 != 0 && isBoxDrawingChar(cell.chars.0) { hasBoxDrawing = true }
         }
         let actualCount = lastNonEmptyCol + 1
@@ -485,7 +619,7 @@ class TerminalState {
             inCodeBlock.toggle()
         }
 
-        let isMono = hasBoxDrawing || inCodeBlock
+        let isMono = hasBoxDrawing || inCodeBlock || looksTabular(rawLine)
         let lineFont = isMono ? monoFont : propFont
 
         let (archivedLine, tabStops, _) = buildLine(
@@ -499,7 +633,7 @@ class TerminalState {
 
         archivedLine.append(NSAttributedString(string: "\n", attributes: [.font: propFont]))
 
-        let pStyle = lockedLineStyle(tabStops: tabStops, colWidth: colWidth, propFont: propFont)
+        let pStyle = lockedLineStyle(tabStops: tabStops, colWidth: colWidth)
         archivedLine.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: archivedLine.length))
         
         self.detectLinks(in: archivedLine)
@@ -558,14 +692,14 @@ class TerminalState {
         
         let fullText = NSMutableAttributedString()
         
-        let propFont = NSFont(name: TerminalConfig.current.proportionalFontName, size: TerminalConfig.current.proportionalFontSize) ?? NSFont.systemFont(ofSize: TerminalConfig.current.proportionalFontSize)
-        let defaultTextColor = TerminalConfig.current.textColor
-        let colWidth: CGFloat = TerminalConfig.current.columnWidth
+        let metrics = self.metrics
+        let propFont = metrics.propFont
+        let monoFont = metrics.monoFont
+        let defaultTextColor = metrics.textColor
+        let colWidth = metrics.colWidth
         
         var currentParagraph = NSMutableAttributedString()
         var accumulatedTabStops: [NSTextTab] = []
-        
-        let monoFont = NSFont(name: TerminalConfig.current.monoFontName, size: TerminalConfig.current.monoFontSize) ?? NSFont.monospacedSystemFont(ofSize: TerminalConfig.current.monoFontSize, weight: .regular)
         
         // Track code fences across the active grid, starting from the scrollback state
         var gridInCodeBlock = inCodeBlock
@@ -586,6 +720,9 @@ class TerminalState {
                     } else {
                         hasNonBoxContent = true
                     }
+                } else if hasVisibleBackground(cell) {
+                    lastNonEmptyCol = Int(c)
+                    hasNonBoxContent = true
                 }
             }
             // Pure border lines: ╭────╮, ╰────╯, ────── etc.
@@ -621,11 +758,13 @@ class TerminalState {
             // Skip lone overflow chars: a pure border line with ≤3 chars is almost certainly
             // a single `─` that spilled from the previous row due to width rounding.
             // Suppress it entirely rather than rendering a stray dash on its own line.
-            if isPureBorderLine && actualLineCount <= 3 && r != cursor.row {
+            // Full-screen apps own every row, so never drop one there.
+            if isPureBorderLine && actualLineCount <= 3 && r != cursor.row && !isAlternateBuffer {
                 continue
             }
 
-            let isMono = hasBoxDrawing || gridInCodeBlock
+            // Full-screen apps (vim, less, htop) address cells by column, so they get the grid.
+            let isMono = isAlternateBuffer || hasBoxDrawing || gridInCodeBlock || looksTabular(rawLine)
             let lineFont = isMono ? monoFont : propFont
 
             let (processedLineAttrs, lineTabStops, colToIndex) = buildLine(
@@ -644,11 +783,11 @@ class TerminalState {
 
             if r == cursor.row {
                 let safeCol = min(Int(cursor.col), actualLineCount)
-                textCursorIndex = fullText.length + currentParagraph.length + (colToIndex[safeCol] ?? processedLineAttrs.length)
+                textCursorIndex = fullText.length + currentParagraph.length + colToIndex[safeCol]
                 foundCursor = true
             }
 
-            if trimCol >= vtermCols - 2 && trimCol > 0 && r != cursor.row && !isPureBorderLine {
+            if trimCol >= vtermCols - 2 && trimCol > 0 && r != cursor.row && !isPureBorderLine && !isAlternateBuffer {
                 // Soft wrap — only for genuine long text lines that the shell wrapped.
                 // Pure border lines (╭────╮, ╰────╯) also fill the width but must
                 // always hard-break so they never merge with the next line's prompt.
@@ -658,7 +797,7 @@ class TerminalState {
                 processedLineAttrs.append(NSAttributedString(string: "\n", attributes: [.font: propFont]))
                 currentParagraph.append(processedLineAttrs)
 
-                let pStyle = lockedLineStyle(tabStops: accumulatedTabStops, colWidth: colWidth, propFont: propFont)
+                let pStyle = lockedLineStyle(tabStops: accumulatedTabStops, colWidth: colWidth)
                 currentParagraph.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: currentParagraph.length))
 
                 fullText.append(currentParagraph)
@@ -668,7 +807,7 @@ class TerminalState {
         }
 
         if currentParagraph.length > 0 {
-            let pStyle = lockedLineStyle(tabStops: accumulatedTabStops, colWidth: colWidth, propFont: propFont)
+            let pStyle = lockedLineStyle(tabStops: accumulatedTabStops, colWidth: colWidth)
             currentParagraph.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: currentParagraph.length))
             fullText.append(currentParagraph)
         }
@@ -713,7 +852,9 @@ class TerminalState {
             textStorage.replaceCharacters(in: replaceRange, with: fullText)
             textStorage.endEditing()
             
-            textView.needsDisplay = true
+            // Only the visible area: the view spans the whole scrollback, and invalidating
+            // all of it made every frame repaint hundreds of thousands of points.
+            textView.setNeedsDisplay(textView.visibleRect)
             wasInAlternateBuffer = true
             
             // Lock to the top so there's no visual offset
@@ -757,7 +898,7 @@ class TerminalState {
         textStorage.replaceCharacters(in: gridRange, with: fullText)
         textStorage.endEditing()
         
-        textView.needsDisplay = true
+        textView.setNeedsDisplay(textView.visibleRect)
         
         if let tv = textView as? TerminalTextView {
             tv.isProgrammaticSelection = true

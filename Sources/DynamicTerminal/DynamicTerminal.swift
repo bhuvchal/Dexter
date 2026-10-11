@@ -127,7 +127,23 @@ class TerminalWindowController: NSWindowController, NSWindowDelegate, NSTextView
         scrollView.verticalScrollElasticity = .allowed
         scrollView.scrollerKnobStyle = .light
         
-        textView = TerminalTextView(frame: scrollView.bounds)
+        // TextKit 1 with non-contiguous layout: only the visible lines get laid out.
+        // TextKit 2 (the default) walks every paragraph to estimate scroll offsets, and each
+        // scrollback line is a paragraph, so layout grew with history and froze the UI
+        // during floods.
+        let textStorage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        layoutManager.allowsNonContiguousLayout = true
+        textStorage.addLayoutManager(layoutManager)
+        let textContainer = NSTextContainer(size: NSSize(width: scrollView.contentSize.width, height: .greatestFiniteMagnitude))
+        textContainer.widthTracksTextView = true
+        layoutManager.addTextContainer(textContainer)
+
+        textView = TerminalTextView(frame: scrollView.bounds, textContainer: textContainer)
+        textView.minSize = NSSize(width: 0, height: scrollView.contentSize.height)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.isEditable = true // Must be true to become first responder
         textView.isSelectable = true

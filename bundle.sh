@@ -10,7 +10,11 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 echo "→ Building release binary..."
-swift build -c release
+# Record the real SDK version in the binary. SwiftPM's link step otherwise stamps the
+# deployment target (14.0) as the SDK, and macOS then gives the app its old-style
+# compatibility window chrome (traffic lights, corners) instead of the current design.
+SDK_VERSION=$(xcrun --show-sdk-version)
+swift build -c release -Xlinker -platform_version -Xlinker macos -Xlinker 14.0 -Xlinker "$SDK_VERSION"
 
 echo "→ Creating app bundle..."
 rm -rf "$BUNDLE_DIR"

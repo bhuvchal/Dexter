@@ -301,6 +301,7 @@ class TerminalState {
         let usableHeight = max(0, boundsSize.height - 80)  // 40pt vertical inset * 2
 
         cachedMetrics = nil
+        symbolWidthCache.removeAll()
         let colWidth = metrics.colWidth
         let lineHeight = metrics.lineHeight
 
@@ -385,6 +386,26 @@ class TerminalState {
             || (scalar >= 0x2700 && scalar <= 0x27BF)  // Dingbats (✓✕✔✗)
     }
     
+    // Symbols spinners cycle through (Claude Code: · ✢ ✳ ✶ ✻ ✽ ⏺), on top of the fixed-width set.
+    private func isSpinnerSymbol(_ scalar: UInt32) -> Bool {
+        return isFixedWidthChar(scalar)
+            || scalar == 0x00B7                        // Middle dot (·)
+            || scalar == 0x2022 || scalar == 0x2219    // Bullets (• ∙)
+            || scalar == 0x22C5                        // Dot operator (⋅)
+            || (scalar >= 0x2190 && scalar <= 0x21FF)  // Arrows (↑ ↓ →)
+            || (scalar >= 0x2300 && scalar <= 0x23FF)  // Misc Technical (⏺ ⎿ ⏵)
+    }
+
+    // Natural glyph widths, measured once per symbol and font.
+    private var symbolWidthCache: [String: CGFloat] = [:]
+    private func symbolWidth(_ symbol: String, font: NSFont) -> CGFloat {
+        let key = "\(symbol)|\(font.fontName)|\(font.pointSize)"
+        if let cached = symbolWidthCache[key] { return cached }
+        let width = NSAttributedString(string: symbol, attributes: [.font: font]).size().width
+        symbolWidthCache[key] = width
+        return width
+    }
+
     // --- URL Detection for Clickable Links ---
     private func detectLinks(in string: NSMutableAttributedString) {
         let text = string.string
@@ -494,6 +515,7 @@ class TerminalState {
             runLength = 0
         }
 
+        var seenText = false
         var i = 0
         while i < count {
             let cell = cellProvider(i)
@@ -554,15 +576,51 @@ class TerminalState {
 
             colToIndex[i] = result.length + runLength
             let displayedChar = mapSymbol(Character(UnicodeScalar(cell.chars.0)!))
-            if !isMono && isFixedWidthChar(cell.chars.0) {
-                // Pad symbol chars to column width only in proportional mode;
+
+            // Spinners lead their line followed by a space: Unicode ones (· ✢ ✻ ⏺) and ASCII
+            // ones (| / - \\ *). They cycle through glyphs of different widths, so they get
+            // exactly one column or every frame shifts the text after them.
+            let scalar = cell.chars.0
+            let isASCIIMarker = scalar < 0x80
+                && !Character(UnicodeScalar(scalar)!).isLetter
+                && !Character(UnicodeScalar(scalar)!).isNumber
+            let maybeMarker = !seenText && (isSpinnerSymbol(scalar) || isASCIIMarker)
+            seenText = true
+
+            // Count the blanks right after a marker; it and its following space are fitted
+            // together so the space isn't swallowed by a wide glyph.
+            var trailingBlanks = 0
+            if maybeMarker {
+                while i + 1 + trailingBlanks < count && isBlankCell(cellProvider(i + 1 + trailingBlanks)) {
+                    trailingBlanks += 1
+                }
+            }
+            let isLeadingMarker = maybeMarker && trailingBlanks > 0
+
+            if !isMono && !isLeadingMarker && isFixedWidthChar(scalar) {
+                // Pad other symbol chars to column width only in proportional mode;
                 // in mono mode the font's fixed advance width already handles this.
                 flush()
                 var symbolAttributes = runAttributes
-                let naturalWidth = NSAttributedString(string: displayedChar, attributes: [.font: runAttributes[.font] ?? font]).size().width
-                let padding = colWidth - naturalWidth
+                let symbolFont = (runAttributes[.font] as? NSFont) ?? font
+                let padding = colWidth - symbolWidth(displayedChar, font: symbolFont)
                 if padding > 0 {
                     symbolAttributes[.kern] = padding
+                }
+                result.append(NSAttributedString(string: displayedChar, attributes: symbolAttributes))
+            } else if !isMono && isLeadingMarker {
+                // Fit the marker and the space after it to their exact columns, padding narrow
+                // glyphs and tightening wide ones without swallowing the space.
+                flush()
+                var symbolAttributes = runAttributes
+                let symbolFont = (runAttributes[.font] as? NSFont) ?? font
+                // Only one or two literal spaces follow; longer runs become tab stops.
+                let fittedBlanks = (1...2).contains(trailingBlanks) && !alignColumns ? trailingBlanks : 0
+                let targetWidth = CGFloat(1 + fittedBlanks) * colWidth
+                    - CGFloat(fittedBlanks) * symbolWidth(" ", font: font)
+                let adjustment = targetWidth - symbolWidth(displayedChar, font: symbolFont)
+                if adjustment != 0 {
+                    symbolAttributes[.kern] = adjustment
                 }
                 result.append(NSAttributedString(string: displayedChar, attributes: symbolAttributes))
             } else {

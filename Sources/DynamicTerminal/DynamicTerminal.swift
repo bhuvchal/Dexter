@@ -3,7 +3,7 @@ import AppKit
 
 class TerminalTextView: NSTextView {
     var onKeyEvent: ((NSEvent) -> Void)?
-    var onScrollDelta: ((CGFloat) -> Bool)?
+    var onScrollDelta: ((CGFloat, NSPoint) -> Bool)?
     var onPaste: ((String) -> Void)?
     var isProgrammaticSelection = false
     var lastCursorPosition: Int = 0
@@ -62,7 +62,7 @@ class TerminalTextView: NSTextView {
     
     override func scrollWheel(with event: NSEvent) {
         // macOS scrollingDeltaY is positive for scrolling UP (content moves down)
-        let handled = onScrollDelta?(event.scrollingDeltaY) ?? false
+        let handled = onScrollDelta?(event.scrollingDeltaY, convert(event.locationInWindow, from: nil)) ?? false
         if !handled {
             super.scrollWheel(with: event)
         }
@@ -195,8 +195,8 @@ class TerminalWindowController: NSWindowController, NSWindowDelegate, NSTextView
             self?.terminalState.writeToPTY(string: string)
         }
         
-        textView.onScrollDelta = { [weak self] deltaY in
-            return self?.terminalState.handleScrollDelta(deltaY) ?? false
+        textView.onScrollDelta = { [weak self] deltaY, point in
+            return self?.terminalState.handleScrollDelta(deltaY, at: point) ?? false
         }
         
         window.makeFirstResponder(textView)

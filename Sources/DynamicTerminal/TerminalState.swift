@@ -22,6 +22,10 @@ func vterm_on_settermprop(prop: VTermProp, val: UnsafeMutablePointer<VTermValue>
         state.isAlternateBuffer = isAlt
         state.accumulatedScrollDelta = 0
         state.onModeChanged?(isAlt)
+    } else if prop == VTERM_PROP_MOUSE {
+        // Programs like Claude Code, vim (mouse=a) and htop ask for mouse reporting;
+        // scrolling then has to reach them as wheel events, not arrow keys.
+        state.mouseReportingEnabled = (val?.pointee.number ?? 0) != Int32(VTERM_PROP_MOUSE_NONE)
     } else if prop == VTERM_PROP_TITLE {
         if let val = val, let strPtr = val.pointee.string.str {
             let len = Int(val.pointee.string.len)
@@ -72,6 +76,7 @@ class TerminalState {
     
     // Mode Switcher State
     var isAlternateBuffer = false
+    var mouseReportingEnabled = false
     var onModeChanged: ((Bool) -> Void)?
     var onTitleChanged: ((String) -> Void)?
     
@@ -975,10 +980,23 @@ class TerminalState {
         }
     }
     // --- Smooth Trackpad Scrolling Translation ---
-    func handleScrollDelta(_ deltaY: CGFloat) -> Bool {
-        // We only translate scrolling into arrow keys when in the alternate buffer (e.g., man, vim).
-        // Standard shell history uses the native NSScrollView.
-        guard ptyFD > 0, isAlternateBuffer else { return false }
+    // Maps a point in the text view to the terminal cell under it, for mouse reports.
+    // Only exact for the alternate screen, which is pinned to the top of the view.
+    private func cell(at point: NSPoint) -> (row: Int32, col: Int32) {
+        var rows = Int32(0)
+        var cols = Int32(0)
+        vterm_get_size(vterm, &rows, &cols)
+        let inset = textView?.textContainerInset ?? .zero
+        let row = Int32(max(0, (point.y - inset.height) / metrics.lineHeight))
+        let col = Int32(max(0, (point.x - inset.width) / metrics.colWidth))
+        return (min(row, rows - 1), min(col, cols - 1))
+    }
+
+    func handleScrollDelta(_ deltaY: CGFloat, at point: NSPoint? = nil) -> Bool {
+        // Programs that asked for mouse reporting get wheel events. Otherwise we only translate
+        // scrolling into arrow keys in the alternate buffer (e.g. man, less); the shell's own
+        // history uses the native NSScrollView.
+        guard ptyFD > 0, isAlternateBuffer || mouseReportingEnabled else { return false }
         
         // Reset accumulation if direction changes to prevent rubber-banding
         if (deltaY > 0 && accumulatedScrollDelta < 0) || (deltaY < 0 && accumulatedScrollDelta > 0) {
@@ -988,18 +1006,33 @@ class TerminalState {
         // Add the new physical movement to our accumulator
         accumulatedScrollDelta += deltaY
         
+        // Wheel events report the pointer's cell, so e.g. the vim split under it scrolls.
+        if mouseReportingEnabled, let point = point {
+            let target = cell(at: point)
+            vterm_mouse_move(vterm, target.row, target.col, VTERM_MOD_NONE)
+        }
+
         // Define how many pixels of trackpad physical movement equals one terminal row
         let scrollThreshold: CGFloat = 10.0 // roughly one line of text
         
         while accumulatedScrollDelta >= scrollThreshold {
-            // Scrolled UP (content moves DOWN) -> Send UP arrow
-            vterm_keyboard_key(vterm, VTERM_KEY_UP, VTERM_MOD_NONE)
+            // Scrolled UP (content moves DOWN) -> wheel up (button 4), or the UP arrow.
+            // Arrows would page through Claude Code's prompt history instead of scrolling.
+            if mouseReportingEnabled {
+                vterm_mouse_button(vterm, 4, true, VTERM_MOD_NONE)
+            } else {
+                vterm_keyboard_key(vterm, VTERM_KEY_UP, VTERM_MOD_NONE)
+            }
             accumulatedScrollDelta -= scrollThreshold
         }
         
         while accumulatedScrollDelta <= -scrollThreshold {
-            // Scrolled DOWN (content moves UP) -> Send DOWN arrow
-            vterm_keyboard_key(vterm, VTERM_KEY_DOWN, VTERM_MOD_NONE)
+            // Scrolled DOWN (content moves UP) -> wheel down (button 5), or the DOWN arrow
+            if mouseReportingEnabled {
+                vterm_mouse_button(vterm, 5, true, VTERM_MOD_NONE)
+            } else {
+                vterm_keyboard_key(vterm, VTERM_KEY_DOWN, VTERM_MOD_NONE)
+            }
             accumulatedScrollDelta += scrollThreshold
         }
         

@@ -8,6 +8,13 @@ automatically, so they stay aligned.
 
 <p align="center"><img src="Resources/AppIcon-1024.png" width="128" alt="Dynamic Terminal icon"></p>
 
+<p align="center"><img src="docs/screenshots/hero.png" width="760" alt="Dynamic Terminal showing git log, an ls -l table and a code fence"></p>
+
+Columns in tables like `ls -l` still line up in the serif. Full-screen apps such
+as vim, less and Claude Code work too:
+
+<p align="center"><img src="docs/screenshots/vim.png" width="760" alt="Editing a Swift file in vim inside Dynamic Terminal"></p>
+
 ## Status
 
 Early. It's my daily driver, but expect rough edges, especially with apps that
